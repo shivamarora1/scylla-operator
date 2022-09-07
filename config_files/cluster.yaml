@@ -31,7 +31,7 @@ spec:
         scyllaAgentConfig: "scylla-agent-config"
         members: 3
         storage:
-        storageClassName: ebs-main-sc
+          storageClassName: ebs-main-sc
           capacity: 5Gi
         resources:
           requests:
