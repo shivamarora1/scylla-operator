@@ -26,6 +26,20 @@ Scylla benching results.
 ```
 kubectl exec -n scylla -it simple-cluster-us-east-1-us-east-1a-0 -- cqlsh
 ```
+5. Deploy scylla manager for backup and repair related tasks. Make sure Scylla manager is not deployed on Scylla cluster Nodes. If you want to deploy it with operator and monitoring node make sure you increase the CPU and memory.
+```
+k apply -f manager.yaml
+```
+6. After scylla manager deployment is completed check Scylla Cluster registered with Scylla Manager or not.
+```
+k -n scylla describe ScyllaCluster
+```
+Check Manager Id output of above command.
+7. Now set up periodic back up in S3 bucket. First set up secret for AWS bucket so that scylla agent can upload files to bucket. Update `access_key_id` and `secret_access_key` in the `scylla-manager-agent.yaml` file.
+```
+kubectl create secret -n scylla generic scylla-agent-config-secret --from-file scylla-manager-agent.yaml
+```
+
 5. If everything worked as expected next step is to set up monitoring stack.
 6. Add monitoring stack charts repository:
 ```
