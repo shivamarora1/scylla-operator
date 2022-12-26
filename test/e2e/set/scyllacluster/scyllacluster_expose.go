@@ -52,10 +52,15 @@ var _ = g.Describe("ScyllaCluster Ingress", func() {
 		waitCtx, waitCtxCancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtxCancel()
 
-		sc, err = utils.WaitForScyllaClusterState(waitCtx, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		verifyScyllaCluster(ctx, f.KubeClient(), sc, nil)
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+
+		hosts := getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(1))
+		di := insertAndVerifyCQLData(ctx, hosts)
+		defer di.Close()
 
 		framework.By("Verifying AnyNode Ingresses")
 		services, err := f.KubeClient().CoreV1().Services(sc.Namespace).List(ctx, metav1.ListOptions{
@@ -81,8 +86,8 @@ var _ = g.Describe("ScyllaCluster Ingress", func() {
 			sc.Spec.ExposeOptions.CQL.Ingress.IngressClassName,
 			&services.Items[0],
 			[]string{
-				"any.cql.private.nodes.scylladb.com",
-				"any.cql.public.nodes.scylladb.com",
+				"cql.private.nodes.scylladb.com",
+				"cql.public.nodes.scylladb.com",
 			},
 			"cql-ssl",
 		)

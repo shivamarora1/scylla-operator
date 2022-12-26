@@ -36,20 +36,17 @@ var _ = g.Describe("ScyllaCluster Orphaned PV", func() {
 		sc, err := f.ScyllaClient().ScyllaV1().ScyllaClusters(f.Namespace()).Create(ctx, sc, metav1.CreateOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		framework.By("Waiting for the ScyllaCluster to deploy")
+		framework.By("Waiting for the ScyllaCluster to rollout (RV=%s)", sc.ResourceVersion)
 		waitCtx1, waitCtx1Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx1Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		di, err := NewDataInserter(ctx, f.KubeClient().CoreV1(), sc, utils.GetMemberCount(sc))
-		o.Expect(err).NotTo(o.HaveOccurred())
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+		hosts := getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(3))
+		di := insertAndVerifyCQLData(ctx, hosts)
 		defer di.Close()
-
-		err = di.Insert()
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		verifyScyllaCluster(ctx, f.KubeClient(), sc, di)
 
 		framework.By("Simulating a PV on node that's gone")
 		stsName := naming.StatefulSetNameForRack(sc.Spec.Datacenter.Racks[0], sc)
@@ -100,28 +97,34 @@ var _ = g.Describe("ScyllaCluster Orphaned PV", func() {
 		framework.By("Waiting for the PVC to be replaced")
 		waitCtx2, waitCtx2Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx2Cancel()
-		pvc, err = utils.WaitForPVCState(waitCtx2, f.KubeClient().CoreV1(), pvc.Namespace, pvc.Name, func(freshPVC *corev1.PersistentVolumeClaim) (bool, error) {
+		pvc, err = utils.WaitForPVCState(waitCtx2, f.KubeClient().CoreV1(), pvc.Namespace, pvc.Name, utils.WaitForStateOptions{TolerateDelete: true}, func(freshPVC *corev1.PersistentVolumeClaim) (bool, error) {
 			return freshPVC.UID != pvc.UID, nil
-		}, utils.WaitForStateOptions{
-			TolerateDelete: true,
 		})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		framework.By("Waiting for the ScyllaCluster to observe the degradation")
 		waitCtx3, waitCtx3Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx3Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx3, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, func(sc *scyllav1.ScyllaCluster) (bool, error) {
+		sc, err = utils.WaitForScyllaClusterState(waitCtx3, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, func(sc *scyllav1.ScyllaCluster) (bool, error) {
 			rolledOut, err := utils.IsScyllaClusterRolledOut(sc)
 			return !rolledOut, err
 		})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		framework.By("Waiting for the ScyllaCluster to deploy")
+		framework.By("Waiting for the ScyllaCluster to rollout (RV=%s)", sc.ResourceVersion)
 		waitCtx4, waitCtx4Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx4Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx4, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx4, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		verifyScyllaCluster(ctx, f.KubeClient(), sc, di)
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+
+		oldHosts := hosts
+		hosts = getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(len(oldHosts)))
+		o.Expect(hosts).NotTo(o.ConsistOf(oldHosts))
+		err = di.SetClientEndpoints(hosts)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		verifyCQLData(ctx, di)
 	})
 })

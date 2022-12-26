@@ -47,20 +47,17 @@ var _ = g.Describe("Scylla Manager integration", func() {
 		sc, err := f.ScyllaClient().ScyllaV1().ScyllaClusters(f.Namespace()).Create(ctx, sc, metav1.CreateOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		framework.By("Waiting for the ScyllaCluster to deploy")
+		framework.By("Waiting for the ScyllaCluster to rollout (RV=%s)", sc.ResourceVersion)
 		waitCtx1, waitCtx1Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx1Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		di, err := NewDataInserter(ctx, f.KubeClient().CoreV1(), sc, utils.GetMemberCount(sc))
-		o.Expect(err).NotTo(o.HaveOccurred())
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+		hosts := getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(1))
+		di := insertAndVerifyCQLData(ctx, hosts)
 		defer di.Close()
-
-		err = di.Insert()
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		verifyScyllaCluster(ctx, f.KubeClient(), sc, di)
 
 		framework.By("Waiting for the cluster sync with Scylla Manager")
 		registeredInManagerCond := func(sc *scyllav1.ScyllaCluster) (bool, error) {
@@ -87,12 +84,7 @@ var _ = g.Describe("Scylla Manager integration", func() {
 
 		waitCtx2, waitCtx2Cancel := utils.ContextForManagerSync(ctx, sc)
 		defer waitCtx2Cancel()
-		conditions := []func(cluster *scyllav1.ScyllaCluster) (bool, error){
-			registeredInManagerCond,
-			repairTaskScheduledCond,
-			backupTaskSyncFailedCond,
-		}
-		sc, err = utils.WaitForScyllaClusterState(waitCtx2, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, conditions...)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx2, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, registeredInManagerCond, repairTaskScheduledCond, backupTaskSyncFailedCond)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		managerClient, err := utils.GetManagerClient(ctx, f.KubeAdminClient().CoreV1())

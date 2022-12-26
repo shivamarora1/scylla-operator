@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"github.com/onsi/ginkgo/v2/reporters"
 	"github.com/onsi/ginkgo/v2/types"
 	"github.com/onsi/gomega"
+	gomegaformat "github.com/onsi/gomega/format"
 	"github.com/scylladb/scylla-operator/pkg/cmdutil"
 	"github.com/scylladb/scylla-operator/pkg/genericclioptions"
 	"github.com/scylladb/scylla-operator/pkg/signals"
@@ -34,8 +36,9 @@ import (
 )
 
 const (
-	parallelShardFlagKey         = "parallel-shard"
-	parallelServerAddressFlagKey = "parallel-server-address"
+	parallelShardFlagKey            = "parallel-shard"
+	parallelServerAddressFlagKey    = "parallel-server-address"
+	ginkgoOutputInterceptorModeNone = "none"
 )
 
 var suites = ginkgotest.TestSuites{
@@ -269,6 +272,7 @@ func (o *RunOptions) run(ctx context.Context, streams genericclioptions.IOStream
 	suiteConfig.FailFast = o.FailFast
 	suiteConfig.RandomSeed = o.RandomSeed
 	suiteConfig.DryRun = o.DryRun
+	suiteConfig.OutputInterceptorMode = ginkgoOutputInterceptorModeNone
 	reporterConfig.Verbose = !o.Quiet
 	reporterConfig.NoColor = !o.Color
 
@@ -297,6 +301,9 @@ func (o *RunOptions) run(ctx context.Context, streams genericclioptions.IOStream
 	// Better context and it's required for nested assertions. Offset doesn't really solve it as it omits the nested function line.
 	reporterConfig.FullTrace = true
 	reporterConfig.SlowSpecThreshold = 10 * time.Minute
+	gomegaformat.MaxLength = 0
+	gomegaformat.MaxDepth = 20
+	gomegaformat.TruncatedDiff = false
 
 	gomega.RegisterFailHandler(ginkgo.Fail)
 
@@ -318,6 +325,9 @@ func (o *RunOptions) run(ctx context.Context, streams genericclioptions.IOStream
 		if suiteConfig.ParallelTotal > 1 {
 			suiteConfig.ParallelHost = o.ParallelServerAddress
 			suiteConfig.ParallelProcess = o.ParallelShard
+
+			ginkgo.GinkgoWriter.TeeTo(os.Stdout)
+			defer ginkgo.GinkgoWriter.ClearTeeWriters()
 		}
 
 		klog.InfoS("Running specs")
@@ -375,7 +385,7 @@ func (o *RunOptions) run(ctx context.Context, streams genericclioptions.IOStream
 		if err != nil {
 			errs = append(errs, fmt.Errorf("can't start command %q with args %v: %w", e.cmd.Path, e.cmd.Args, err))
 		}
-		klog.V(2).InfoS("Started process", "ID", e.id, "Process", e.cmd.String())
+		klog.V(2).InfoS("Started process", "ID", e.id, "Command", e.cmd.String())
 		// RegisterAlive needs to be set so ginkgo worker #1 can detect all the other workers are finished
 		// and start serial tests. It needs cmd.Wait to be called first to pick up the state.
 		server.RegisterAlive(e.id, func() bool { return e.cmd.ProcessState == nil || !e.cmd.ProcessState.Exited() })
@@ -396,20 +406,39 @@ func (o *RunOptions) run(ctx context.Context, streams genericclioptions.IOStream
 		go func() {
 			defer wg.Done()
 
-			klog.V(2).InfoS("Waiting for process", "ID", e.id, "Process", e.cmd.String())
+			klog.V(2).InfoS("Waiting for process", "ID", e.id, "Command", e.cmd.String())
 			err := e.cmd.Wait()
-			if err != nil {
+			// We'll handle exit codes separately.
+			var exitError *exec.ExitError
+			if err != nil && !errors.As(err, &exitError) {
 				errs[entryIndex] = fmt.Errorf("can't wait for command %q with args %q: %w", e.cmd.Path, e.cmd.Args, err)
 			}
-			klog.V(2).InfoS("Process finished", "ID", e.id, "Process", e.cmd.String(), "ExitCode", e.cmd.ProcessState.ExitCode())
+			klog.V(2).InfoS("Process finished", "ID", e.id, "Command", e.cmd.String(), "ProcessState", e.cmd.ProcessState.String())
 		}()
-	}
-	err = apierrors.NewAggregate(errs)
-	if err != nil {
-		return err
 	}
 
 	wg.Wait()
+
+	err = apierrors.NewAggregate(errs)
+	if err != nil {
+		return fmt.Errorf("can't wait for processes: %w", err)
+	}
+
+	// Aggregate exit code.
+	hasProgrammaticFocus := false
+	passed := true
+	for _, e := range cmdEntries {
+		exitCode := e.cmd.ProcessState.ExitCode()
+		switch exitCode {
+		case 0:
+			break
+		case types.GINKGO_FOCUS_EXIT_CODE:
+			hasProgrammaticFocus = true
+		default:
+			passed = false
+			klog.ErrorS(errors.New("process failed"), "Process failed", "ID", e.id, "Command", e.cmd.String(), "ProcessState", e.cmd.ProcessState.String(), "Logs", e.out.String())
+		}
+	}
 
 	select {
 	case <-ctx.Done():
@@ -419,40 +448,15 @@ func (o *RunOptions) run(ctx context.Context, streams genericclioptions.IOStream
 		break
 
 	default:
-		for _, e := range cmdEntries {
-			exitCode := e.cmd.ProcessState.ExitCode()
-			switch exitCode {
-			case 0, types.GINKGO_FOCUS_EXIT_CODE:
-				break
-			default:
-				klog.ErrorS(nil, "Process failed", "ID", e.id, "Process", e.cmd.String(), "Logs", e.out.String())
-			}
-		}
-
 		return fmt.Errorf("all processes have finished but the suite still isn't done")
-	}
-
-	// Aggregate exit code.
-	hasProgramaticFocus := false
-	passed := true
-	for _, e := range cmdEntries {
-		exitCode := e.cmd.ProcessState.ExitCode()
-		switch exitCode {
-		case 0:
-			break
-		case types.GINKGO_FOCUS_EXIT_CODE:
-			hasProgramaticFocus = true
-		default:
-			passed = false
-		}
 	}
 
 	if !passed {
 		return fmt.Errorf("test suite failed")
 	}
 
-	if hasProgramaticFocus {
-		return fmt.Errorf("test suite has programatic focus")
+	if hasProgrammaticFocus {
+		return fmt.Errorf("test suite has programmatic focus")
 	}
 
 	return nil

@@ -37,20 +37,17 @@ var _ = g.Describe("ScyllaCluster", func() {
 		originalSC := sc.DeepCopy()
 		originalSC.ResourceVersion = ""
 
-		framework.By("Waiting for the ScyllaCluster to deploy")
+		framework.By("Waiting for the ScyllaCluster to rollout (RV=%s)", sc.ResourceVersion)
 		waitCtx1, waitCtx1Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx1Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		di, err := NewDataInserter(ctx, f.KubeClient().CoreV1(), sc, utils.GetMemberCount(sc))
-		o.Expect(err).NotTo(o.HaveOccurred())
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+		hosts := getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(membersCount))
+		di := insertAndVerifyCQLData(ctx, hosts)
 		defer di.Close()
-
-		err = di.Insert()
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		verifyScyllaCluster(ctx, f.KubeClient(), sc, di)
 
 		framework.By("Deleting the ScyllaCluster")
 		var propagationPolicy = metav1.DeletePropagationForeground
@@ -101,11 +98,17 @@ var _ = g.Describe("ScyllaCluster", func() {
 		framework.By("Waiting for the ScyllaCluster to redeploy")
 		waitCtx3, waitCtx3Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx3Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx3, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx3, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		err = di.UpdateClientEndpoints(ctx, sc)
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+
+		oldHosts := hosts
+		hosts = getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(len(oldHosts)))
+		o.Expect(hosts).NotTo(o.ConsistOf(oldHosts))
+		err = di.SetClientEndpoints(hosts)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		verifyScyllaCluster(ctx, f.KubeClient(), sc, di)
+		verifyCQLData(ctx, di)
 	})
 })
