@@ -73,7 +73,16 @@ Check Manager Id output of above command.
 ```
 kubectl create secret -n scylla generic scylla-agent-config-secret --from-file scylla-manager-agent.yaml
 ```
-4. To schedule a backup, Add following keys under specs:
+4. Restart the cluster
+```
+kubectl rollout restart -n scylla statefulset/<deployment_name>
+```
+after restart you can do bash in scylla-manager-agent and check changes in .yaml file.
+```
+k exec -n scylla <pod_name> -ti -c scylla-manager-agent -- bash 
+cat /mnt/scylla-agent-config/scylla-manager-agent.yaml
+```
+5. To schedule a backup, Add following keys under specs:
 execute:
 ```
 k -n scylla edit ScyllaCluster simple-cluster
@@ -95,7 +104,7 @@ then add this to configuration:
     location: ["s3:<BUCKET_NAME>"]
     interval: "7d"
 ```
-5. Check whether task was successfully assigned or not:
+6. Check whether task was successfully assigned or not:
 ```
 kubectl -n scylla-manager exec -ti scylla-manager-scylla-manager-7bd9f968b9-w25jw -- sctool task list
 ```
