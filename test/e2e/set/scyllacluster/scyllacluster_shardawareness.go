@@ -28,6 +28,10 @@ var _ = g.Describe("ScyllaCluster", func() {
 	f := framework.NewFramework("scyllacluster")
 
 	g.It("should allow to build connection pool using shard aware ports", func() {
+		g.Skip("Shardawareness doesn't work on setups NATting traffic, and our CI does it when traffic is going through ClusterIPs." +
+			"It's shall be reenabled once we switch client-node communication to PodIPs.",
+		)
+
 		const (
 			nonShardAwarePort = 9042
 			shardAwarePort    = 19042
@@ -47,14 +51,16 @@ var _ = g.Describe("ScyllaCluster", func() {
 		sc, err := f.ScyllaClient().ScyllaV1().ScyllaClusters(f.Namespace()).Create(ctx, sc, metav1.CreateOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		framework.By("Waiting for the ScyllaCluster to deploy")
+		framework.By("Waiting for the ScyllaCluster to rollout (RV=%s)", sc.ResourceVersion)
 		waitCtx1, waitCtx1Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx1Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		hosts, err := utils.GetHosts(ctx, f.KubeClient().CoreV1(), sc)
-		o.Expect(err).NotTo(o.HaveOccurred())
+		hosts := getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(1))
+		di := insertAndVerifyCQLData(ctx, hosts)
+		defer di.Close()
 
 		connections := make(map[uint16]string)
 		var connectionsMut sync.Mutex

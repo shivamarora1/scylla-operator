@@ -24,7 +24,7 @@ function kubectl_create {
         kubectl create "$@"
     else
         # For development iterations we want to update the objects.
-        kubectl apply "$@"
+        kubectl apply --server-side=true "$@"
     fi
 }
 
@@ -41,6 +41,12 @@ cp ./examples/common/cert-manager.yaml "${deploy_dir}/"
 for f in $( find "${deploy_dir}"/ -type f -name '*.yaml' ); do
     sed -i -E -e "s~docker.io/scylladb/scylla-operator(:|@sha256:)[^ ]*~${OPERATOR_IMAGE_REF}~" "${f}"
 done
+
+yq e --inplace '.spec.template.spec.containers[0].args += ["--qps=200", "--burst=400"]' "${deploy_dir}/operator/50_operator.deployment.yaml"
+
+if [[ -n ${SCYLLA_OPERATOR_FEATURE_GATES+x} ]]; then
+    yq e --inplace '.spec.template.spec.containers[0].args += "--feature-gates="+ strenv(SCYLLA_OPERATOR_FEATURE_GATES)' "${deploy_dir}/operator/50_operator.deployment.yaml"
+fi
 
 kubectl_create -f "${deploy_dir}"/cert-manager.yaml
 

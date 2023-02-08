@@ -44,21 +44,19 @@ import (
 
 const (
 	ControllerName = "ScyllaClusterController"
-	// maxSyncDuration enforces preemption. Do not raise the value! Controllers shouldn't actively wait,
-	// but rather use the queue.
-	maxSyncDuration = 40 * time.Second
 
 	artificialDelayForCachesToCatchUp = 10 * time.Second
 )
 
 var (
-	keyFunc                  = cache.DeletionHandlingMetaNamespaceKeyFunc
-	controllerGVK            = scyllav1.GroupVersion.WithKind("ScyllaCluster")
-	statefulSetControllerGVK = appsv1.SchemeGroupVersion.WithKind("StatefulSet")
+	keyFunc                    = cache.DeletionHandlingMetaNamespaceKeyFunc
+	scyllaClusterControllerGVK = scyllav1.GroupVersion.WithKind("ScyllaCluster")
+	statefulSetControllerGVK   = appsv1.SchemeGroupVersion.WithKind("StatefulSet")
 )
 
 type Controller struct {
-	operatorImage string
+	operatorImage   string
+	cqlsIngressPort int
 
 	kubeClient   kubernetes.Interface
 	scyllaClient scyllav1client.ScyllaV1Interface
@@ -66,6 +64,7 @@ type Controller struct {
 	podLister            corev1listers.PodLister
 	serviceLister        corev1listers.ServiceLister
 	secretLister         corev1listers.SecretLister
+	configMapLister      corev1listers.ConfigMapLister
 	serviceAccountLister corev1listers.ServiceAccountLister
 	roleBindingLister    rbacv1listers.RoleBindingLister
 	statefulSetLister    appsv1listers.StatefulSetLister
@@ -86,6 +85,7 @@ func NewController(
 	podInformer corev1informers.PodInformer,
 	serviceInformer corev1informers.ServiceInformer,
 	secretInformer corev1informers.SecretInformer,
+	configMapInformer corev1informers.ConfigMapInformer,
 	serviceAccountInformer corev1informers.ServiceAccountInformer,
 	roleBindingInformer rbacv1informers.RoleBindingInformer,
 	statefulSetInformer appsv1informers.StatefulSetInformer,
@@ -93,6 +93,7 @@ func NewController(
 	ingressInformer networkingv1informers.IngressInformer,
 	scyllaClusterInformer scyllav1informers.ScyllaClusterInformer,
 	operatorImage string,
+	cqlsIngressPort int,
 ) (*Controller, error) {
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartStructuredLogging(0)
@@ -109,7 +110,8 @@ func NewController(
 	}
 
 	scc := &Controller{
-		operatorImage: operatorImage,
+		operatorImage:   operatorImage,
+		cqlsIngressPort: cqlsIngressPort,
 
 		kubeClient:   kubeClient,
 		scyllaClient: scyllaClient,
@@ -117,6 +119,7 @@ func NewController(
 		podLister:            podInformer.Lister(),
 		serviceLister:        serviceInformer.Lister(),
 		secretLister:         secretInformer.Lister(),
+		configMapLister:      configMapInformer.Lister(),
 		serviceAccountLister: serviceAccountInformer.Lister(),
 		roleBindingLister:    roleBindingInformer.Lister(),
 		statefulSetLister:    statefulSetInformer.Lister(),
@@ -128,6 +131,7 @@ func NewController(
 			podInformer.Informer().HasSynced,
 			serviceInformer.Informer().HasSynced,
 			secretInformer.Informer().HasSynced,
+			configMapInformer.Informer().HasSynced,
 			serviceAccountInformer.Informer().HasSynced,
 			roleBindingInformer.Informer().HasSynced,
 			statefulSetInformer.Informer().HasSynced,
@@ -151,6 +155,12 @@ func NewController(
 		AddFunc:    scc.addSecret,
 		UpdateFunc: scc.updateSecret,
 		DeleteFunc: scc.deleteSecret,
+	})
+
+	configMapInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    scc.addConfigMap,
+		UpdateFunc: scc.updateConfigMap,
+		DeleteFunc: scc.deleteConfigMap,
 	})
 
 	// We need pods events to know if a pod is ready after replace operation.
@@ -206,8 +216,6 @@ func (scc *Controller) processNextItem(ctx context.Context) bool {
 	}
 	defer scc.queue.Done(key)
 
-	ctx, cancel := context.WithTimeout(ctx, maxSyncDuration)
-	defer cancel()
 	err := scc.sync(ctx, key.(string))
 	// TODO: Do smarter filtering then just Reduce to handle cases like 2 conflict errors.
 	err = utilerrors.Reduce(err)
@@ -270,7 +278,7 @@ func (scc *Controller) resolveScyllaClusterController(obj metav1.Object) *scylla
 		return nil
 	}
 
-	if controllerRef.Kind != controllerGVK.Kind {
+	if controllerRef.Kind != scyllaClusterControllerGVK.Kind {
 		return nil
 	}
 
@@ -462,13 +470,57 @@ func (scc *Controller) deleteSecret(obj interface{}) {
 	scc.enqueueOwner(secret)
 }
 
-func (sac *Controller) addServiceAccount(obj interface{}) {
-	sa := obj.(*corev1.ServiceAccount)
-	klog.V(4).InfoS("Observed addition of ServiceAccount", "ServiceAccount", klog.KObj(sa))
-	sac.enqueueOwner(sa)
+func (scc *Controller) addConfigMap(obj interface{}) {
+	configMap := obj.(*corev1.ConfigMap)
+	klog.V(4).InfoS("Observed addition of ConfigMap", "ConfigMap", klog.KObj(configMap))
+	scc.enqueueOwner(configMap)
 }
 
-func (sac *Controller) updateServiceAccount(old, cur interface{}) {
+func (scc *Controller) updateConfigMap(old, cur interface{}) {
+	oldConfigMap := old.(*corev1.ConfigMap)
+	currentConfigMap := cur.(*corev1.ConfigMap)
+
+	if currentConfigMap.UID != oldConfigMap.UID {
+		key, err := keyFunc(oldConfigMap)
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", oldConfigMap, err))
+			return
+		}
+		scc.deleteConfigMap(cache.DeletedFinalStateUnknown{
+			Key: key,
+			Obj: oldConfigMap,
+		})
+	}
+
+	klog.V(4).InfoS("Observed update of ConfigMap", "ConfigMap", klog.KObj(oldConfigMap))
+	scc.enqueueOwner(currentConfigMap)
+}
+
+func (scc *Controller) deleteConfigMap(obj interface{}) {
+	configMap, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %#v", obj))
+			return
+		}
+		configMap, ok = tombstone.Obj.(*corev1.ConfigMap)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a ConfigMap %#v", obj))
+			return
+		}
+	}
+	klog.V(4).InfoS("Observed deletion of ConfigMap", "ConfigMap", klog.KObj(configMap))
+	scc.enqueueOwner(configMap)
+}
+
+func (scc *Controller) addServiceAccount(obj interface{}) {
+	sa := obj.(*corev1.ServiceAccount)
+	klog.V(4).InfoS("Observed addition of ServiceAccount", "ServiceAccount", klog.KObj(sa))
+	scc.enqueueOwner(sa)
+}
+
+func (scc *Controller) updateServiceAccount(old, cur interface{}) {
 	oldSA := old.(*corev1.ServiceAccount)
 	currentSA := cur.(*corev1.ServiceAccount)
 
@@ -478,17 +530,17 @@ func (sac *Controller) updateServiceAccount(old, cur interface{}) {
 			utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", oldSA, err))
 			return
 		}
-		sac.deleteServiceAccount(cache.DeletedFinalStateUnknown{
+		scc.deleteServiceAccount(cache.DeletedFinalStateUnknown{
 			Key: key,
 			Obj: oldSA,
 		})
 	}
 
 	klog.V(4).InfoS("Observed update of ServiceAccount", "ServiceAccount", klog.KObj(oldSA))
-	sac.enqueueOwner(currentSA)
+	scc.enqueueOwner(currentSA)
 }
 
-func (sac *Controller) deleteServiceAccount(obj interface{}) {
+func (scc *Controller) deleteServiceAccount(obj interface{}) {
 	svc, ok := obj.(*corev1.ServiceAccount)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
@@ -503,16 +555,16 @@ func (sac *Controller) deleteServiceAccount(obj interface{}) {
 		}
 	}
 	klog.V(4).InfoS("Observed deletion of ServiceAccount", "ServiceAccount", klog.KObj(svc))
-	sac.enqueueOwner(svc)
+	scc.enqueueOwner(svc)
 }
 
-func (sac *Controller) addRoleBinding(obj interface{}) {
+func (scc *Controller) addRoleBinding(obj interface{}) {
 	roleBinding := obj.(*rbacv1.RoleBinding)
 	klog.V(4).InfoS("Observed addition of RoleBinding", "RoleBinding", klog.KObj(roleBinding))
-	sac.enqueueOwner(roleBinding)
+	scc.enqueueOwner(roleBinding)
 }
 
-func (sac *Controller) updateRoleBinding(old, cur interface{}) {
+func (scc *Controller) updateRoleBinding(old, cur interface{}) {
 	oldRoleBinding := old.(*rbacv1.RoleBinding)
 	currentRoleBinding := cur.(*rbacv1.RoleBinding)
 
@@ -522,17 +574,17 @@ func (sac *Controller) updateRoleBinding(old, cur interface{}) {
 			utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", oldRoleBinding, err))
 			return
 		}
-		sac.deleteRoleBinding(cache.DeletedFinalStateUnknown{
+		scc.deleteRoleBinding(cache.DeletedFinalStateUnknown{
 			Key: key,
 			Obj: oldRoleBinding,
 		})
 	}
 
 	klog.V(4).InfoS("Observed update of RoleBinding", "RoleBinding", klog.KObj(oldRoleBinding))
-	sac.enqueueOwner(currentRoleBinding)
+	scc.enqueueOwner(currentRoleBinding)
 }
 
-func (sac *Controller) deleteRoleBinding(obj interface{}) {
+func (scc *Controller) deleteRoleBinding(obj interface{}) {
 	roleBinding, ok := obj.(*rbacv1.RoleBinding)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
@@ -547,7 +599,7 @@ func (sac *Controller) deleteRoleBinding(obj interface{}) {
 		}
 	}
 	klog.V(4).InfoS("Observed deletion of RoleBinding", "RoleBinding", klog.KObj(roleBinding))
-	sac.enqueueOwner(roleBinding)
+	scc.enqueueOwner(roleBinding)
 }
 
 func (scc *Controller) addPod(obj interface{}) {

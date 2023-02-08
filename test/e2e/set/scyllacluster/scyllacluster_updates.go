@@ -40,24 +40,22 @@ var _ = g.Describe("ScyllaCluster", func() {
 		framework.By("Creating a ScyllaCluster")
 		sc := scyllafixture.BasicScyllaCluster.ReadOrFail()
 		o.Expect(sc.Spec.Datacenter.Racks).To(o.HaveLen(1))
+		o.Expect(sc.Spec.Datacenter.Racks[0].Members).To(o.BeEquivalentTo(1))
 
 		sc, err := f.ScyllaClient().ScyllaV1().ScyllaClusters(f.Namespace()).Create(ctx, sc, metav1.CreateOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		framework.By("Waiting for the ScyllaCluster to deploy")
+		framework.By("Waiting for the ScyllaCluster to rollout (RV=%s)", sc.ResourceVersion)
 		waitCtx1, waitCtx1Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx1Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx1, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		di, err := NewDataInserter(ctx, f.KubeClient().CoreV1(), sc, utils.GetMemberCount(sc))
-		o.Expect(err).NotTo(o.HaveOccurred())
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+		hosts := getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(hosts).To(o.HaveLen(1))
+		di := insertAndVerifyCQLData(ctx, hosts)
 		defer di.Close()
-
-		err = di.Insert()
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		verifyScyllaCluster(ctx, f.KubeClient(), sc, di)
 
 		framework.By("Changing pod resources")
 		oldResources := *sc.Spec.Datacenter.Racks[0].Resources.DeepCopy()
@@ -96,8 +94,12 @@ var _ = g.Describe("ScyllaCluster", func() {
 		framework.By("Waiting for the ScyllaCluster to redeploy")
 		waitCtx2, waitCtx2Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx2Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx2, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx2, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
+
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+		o.Expect(hosts).To(o.ConsistOf(getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)))
+		verifyCQLData(ctx, di)
 
 		framework.By("Scaling the ScyllaCluster up to create a new replica")
 		oldMembers := sc.Spec.Datacenter.Racks[0].Members
@@ -118,7 +120,16 @@ var _ = g.Describe("ScyllaCluster", func() {
 		framework.By("Waiting for the ScyllaCluster to redeploy")
 		waitCtx4, waitCtx4Cancel := utils.ContextForRollout(ctx, sc)
 		defer waitCtx4Cancel()
-		sc, err = utils.WaitForScyllaClusterState(waitCtx4, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.IsScyllaClusterRolledOut)
+		sc, err = utils.WaitForScyllaClusterState(waitCtx4, f.ScyllaClient().ScyllaV1(), sc.Namespace, sc.Name, utils.WaitForStateOptions{}, utils.IsScyllaClusterRolledOut)
 		o.Expect(err).NotTo(o.HaveOccurred())
+
+		verifyScyllaCluster(ctx, f.KubeClient(), sc)
+
+		oldHosts := hosts
+		hosts = getScyllaHostsAndWaitForFullQuorum(ctx, f.KubeClient().CoreV1(), sc)
+		o.Expect(oldHosts).To(o.HaveLen(int(oldMembers)))
+		o.Expect(hosts).To(o.HaveLen(int(newMebmers)))
+		o.Expect(hosts).To(o.ContainElements(oldHosts))
+		verifyCQLData(ctx, di)
 	})
 })
